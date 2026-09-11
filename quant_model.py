@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import pandas_market_calendars as mcal
 
 
 DEFAULT_WATCHLIST = [
@@ -55,6 +56,75 @@ def _field(data: pd.DataFrame, field: str, ticker: str) -> pd.Series:
     return data[field].dropna()
 
 
+def latest_completed_session(now=None) -> pd.Timestamp:
+    """NYSE date whose close was at least 30 minutes ago; includes holidays/early closes."""
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
+    schedule = mcal.get_calendar("NYSE").schedule(
+        start_date=(now - pd.Timedelta(days=20)).date(), end_date=now.date())
+    complete = schedule[schedule["market_close"] + pd.Timedelta(minutes=30) <= now]
+    if complete.empty:
+        raise ValueError("无法确定最近已完成的交易日，暂停计算。")
+    return pd.Timestamp(complete.index[-1]).normalize()
+
+
+def completed_daily_data(data: pd.DataFrame, now=None):
+    cutoff = latest_completed_session(now)
+    data = data.copy()
+    data.index = pd.DatetimeIndex(data.index).tz_localize(None).normalize()
+    if data.index.has_duplicates:
+        raise ValueError("行情出现重复日期，暂停计算。")
+    data = data.sort_index().loc[:cutoff].dropna(how="all")
+    if data.empty:
+        raise ValueError("没有已完成交易日的数据。")
+    return data, cutoff
+
+
+def require_history(data, ticker, sessions, asof=None, fields=("Close",)):
+    """Fail closed on incomplete or stale required observations."""
+    if data.empty:
+        raise ValueError("没有行情")
+    target = pd.Timestamp(asof if asof is not None else data.index[-1]).normalize()
+    reference = data.index[data.index <= target][-sessions:]
+    if len(reference) < sessions or pd.Timestamp(reference[-1]).normalize() != target:
+        raise ValueError(f"行情未更新到 {target.date()} 或历史不足{sessions}条")
+    for field in fields:
+        try:
+            series = _field(data, field, ticker).reindex(reference)
+        except (KeyError, TypeError):
+            raise ValueError(f"缺少{field}数据") from None
+        values = series.to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError(f"{field}最近{sessions}条存在缺失或无效值")
+        if (values < 0).any() or (field != "Volume" and (values == 0).any()):
+            raise ValueError(f"{field}包含无效价格或成交量")
+
+
+def data_quality(data, tickers, asof=None):
+    rows = []
+    for ticker in dict.fromkeys(tickers):
+        last_date = "无数据"
+        try:
+            close = _field(data, "Close", ticker)
+            if not close.empty:
+                last_date = str(pd.Timestamp(close.index[-1]).date())
+            require_history(data, ticker, 253, asof)
+            require_history(data, ticker, 21, asof, ("High", "Low", "Volume"))
+            status = "通过"
+        except (ValueError, KeyError, TypeError) as exc:
+            status = str(exc)
+        rows.append({"代码": ticker, "最新数据日": last_date, "检查": status})
+    return pd.DataFrame(rows)
+
+
+def validate_market_data(data, asof=None):
+    for ticker, n in [("SPY", 200), ("QQQ", 200), ("HYG", 200), ("^VIX", 6), ("^TNX", 21)]:
+        try:
+            require_history(data, ticker, n, asof)
+        except ValueError as exc:
+            raise ValueError(f"市场因子 {ticker}：{exc}；暂停市场评分和仓位输出。") from None
+
+
 def _last(series: pd.Series) -> float:
     s = series.dropna()
     return float(s.iloc[-1]) if not s.empty else float("nan")
@@ -81,6 +151,7 @@ def _safe_score(value: float, lo: float, hi: float, invert: bool = False) -> flo
 def market_risk_score(
     data: pd.DataFrame,
     breadth_tickers: Iterable[str] = DEFAULT_WATCHLIST,
+    asof=None,
 ) -> MarketRiskResult:
     """
     Score 0-100. Higher = more supportive risk environment.
@@ -92,6 +163,7 @@ def market_risk_score(
       HYG trend 15
       Breadth 10
     """
+    validate_market_data(data, asof)
     components: Dict[str, float] = {}
     notes: List[str] = []
 
@@ -167,6 +239,7 @@ def market_risk_score(
     above, valid = 0, 0
     for t in breadth_tickers:
         try:
+            require_history(data, t, 200, asof)
             s = _field(data, "Close", t)
         except Exception:
             continue
@@ -174,9 +247,11 @@ def market_risk_score(
         if len(s.dropna()) >= 200 and np.isfinite(_last(ma200)):
             valid += 1
             above += int(_last(s) > _last(ma200))
-    breadth_ratio = above / valid if valid else 0.5
+    if not valid:
+        raise ValueError("股票池没有可用的200日数据，暂停市场评分。")
+    breadth_ratio = above / valid
     breadth_points = 10.0 * breadth_ratio
-    components["市场宽度"] = breadth_points
+    components["股票池宽度（非全市场）"] = breadth_points
 
     total = round(sum(components.values()), 1)
     if total >= 80:
@@ -196,7 +271,7 @@ def market_risk_score(
 def fundamental_score(ticker: str) -> Tuple[float, Dict[str, Optional[float]]]:
     """
     Lightweight fundamental factor using yfinance metadata.
-    If unavailable, return neutral score 50.
+    If unavailable, return NaN; never fabricate a neutral observation.
     This is intentionally conservative because metadata fields can be missing.
     """
     metrics = {
@@ -224,17 +299,21 @@ def fundamental_score(ticker: str) -> Tuple[float, Dict[str, Optional[float]]]:
         if metrics["freeCashflow"] is not None:
             parts.append(70.0 if metrics["freeCashflow"] > 0 else 25.0)
 
-        return (float(np.mean(parts)) if parts else 50.0), metrics
+        return (float(np.mean(parts)) if parts else float("nan")), metrics
     except Exception:
-        return 50.0, metrics
+        return float("nan"), metrics
 
 
 def stock_score(
     data: pd.DataFrame,
     ticker: str,
     benchmark: str = "QQQ",
-    include_fundamentals: bool = True,
+    include_fundamentals: bool = False,
+    asof=None,
 ) -> Dict[str, float]:
+    require_history(data, ticker, 253, asof)
+    require_history(data, ticker, 21, asof, ("High", "Low", "Volume"))
+    require_history(data, benchmark, 253, asof)
     close = _field(data, "Close", ticker)
     volume = _field(data, "Volume", ticker)
     bench = _field(data, "Close", benchmark)
@@ -256,12 +335,9 @@ def stock_score(
     r3 = _pct_change(close, 63)
     r6 = _pct_change(close, 126)
     r12 = _pct_change(close, 252)
-    returns = [r1, r3, r6, r12]
-    if all(np.isfinite(x) for x in returns):
-        weighted_mom = 0.10*r1 + 0.35*r3 + 0.35*r6 + 0.20*r12
-        momentum = 25.0 * (_safe_score(weighted_mom, -0.25, 0.60) / 100.0)
-    else:
-        momentum = 12.5
+    # Approximate the research 12-to-2-month signal with 252/21 trading-day offsets.
+    momentum_12_1 = float(close.iloc[-22] / close.iloc[-253] - 1.0)
+    momentum = 25.0 * (_safe_score(momentum_12_1, -0.25, 0.60) / 100.0)
 
     # 3) Relative strength vs benchmark 15
     rs3 = r3 - _pct_change(bench, 63) if np.isfinite(r3) else float("nan")
@@ -286,7 +362,7 @@ def stock_score(
     volume_score = max(0.0, min(10.0, volume_score))
 
     # 5) Fundamentals 15
-    f_raw, _ = fundamental_score(ticker) if include_fundamentals else (50.0, {})
+    f_raw, _ = fundamental_score(ticker) if include_fundamentals else (float("nan"), {})
     fundamentals = 15.0 * f_raw / 100.0
 
     # 6) Risk 10: reward lower realized volatility and shallower 1y drawdown
@@ -299,7 +375,9 @@ def stock_score(
     dd_part = _safe_score(abs(max_dd), 0.10, 0.60, invert=True)
     risk = 10.0 * (0.6*vol_part + 0.4*dd_part) / 100.0
 
-    total = round(trend + momentum + relative_strength + volume_score + fundamentals + risk, 1)
+    technical = trend + momentum + relative_strength + volume_score + risk
+    # Disabled fundamentals are excluded, not replaced by a constant. Thresholds remain experimental.
+    total = round(technical + fundamentals if include_fundamentals else technical / 85.0 * 100.0, 1)
 
     # ATR for position/risk sizing
     high = _field(data, "High", ticker)
@@ -315,6 +393,9 @@ def stock_score(
 
     return {
         "ticker": ticker,
+        "data_date": str(pd.Timestamp(close.index[-1]).date()),
+        "momentum_12_1_pct": round(momentum_12_1 * 100, 2),
+        "error": "基本面数据缺失，暂停总分" if include_fundamentals and not np.isfinite(f_raw) else "",
         "total": total,
         "trend": round(trend, 1),
         "momentum": round(momentum, 1),
@@ -335,14 +416,15 @@ def score_universe(
     data: pd.DataFrame,
     tickers: Iterable[str],
     benchmark: str = "QQQ",
-    include_fundamentals: bool = True,
+    include_fundamentals: bool = False,
+    asof=None,
 ) -> pd.DataFrame:
     rows = []
     for ticker in tickers:
         try:
-            rows.append(stock_score(data, ticker, benchmark, include_fundamentals))
+            rows.append(stock_score(data, ticker, benchmark, include_fundamentals, asof))
         except Exception as e:
-            rows.append({"ticker": ticker, "total": np.nan, "error": str(e)})
+            rows.append(dict.fromkeys(["total", "price", "trend", "momentum", "relative_strength", "volume", "fundamentals", "risk", "atr_pct", "r1m_pct", "r3m_pct", "r6m_pct", "r12m_pct", "momentum_12_1_pct"], np.nan) | {"ticker": ticker, "error": str(e), "data_date": ""})
     df = pd.DataFrame(rows)
     if "total" in df:
         df = df.sort_values("total", ascending=False, na_position="last").reset_index(drop=True)
@@ -357,7 +439,7 @@ def suggested_position_pct(score: float, atr_pct: float, market_score: float) ->
     - ATR volatility cap
     - hard cap 10%
     """
-    if not np.isfinite(score) or score < 60:
+    if not all(np.isfinite(v) for v in (score, atr_pct, market_score)) or score < 60:
         return 0.0
 
     base = 0.05
@@ -384,3 +466,16 @@ def suggested_position_pct(score: float, atr_pct: float, market_score: float) ->
             vol_mult = 0.85
 
     return round(min(0.10, base * market_mult * vol_mult) * 100, 1)
+
+
+def target_weights(data, tickers, benchmark="QQQ", asof=None):
+    """Shared weekly paper-portfolio rules; fundamental snapshots deliberately excluded."""
+    market = market_risk_score(data, breadth_tickers=tickers, asof=asof)
+    scores = score_universe(data, tickers, benchmark, False, asof)
+    weights = pd.Series({r["ticker"]: suggested_position_pct(r["total"], r["atr_pct"], market.score) / 100
+                         for _, r in scores.iterrows()}, dtype=float)
+    bands = market.suggested_equity_exposure.replace("%", "").split("–")
+    cap = sum(float(x) for x in bands) / 200
+    if weights.sum() > cap:
+        weights *= cap / weights.sum()
+    return weights
