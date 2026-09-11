@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -49,11 +50,21 @@ def download_prices(
     return data
 
 
+@lru_cache(maxsize=512)
+def _nyse_days(start: str, end: str):
+    return mcal.get_calendar("NYSE").valid_days(start_date=start, end_date=end).tz_localize(None)
+
+
 def _field(data: pd.DataFrame, field: str, ticker: str) -> pd.Series:
     """Handle both single-ticker and multi-ticker yfinance layouts."""
     if isinstance(data.columns, pd.MultiIndex):
-        return data[field][ticker].dropna()
-    return data[field].dropna()
+        series = data[field][ticker]
+    else:
+        series = data[field]
+    if series.empty:
+        return series
+    days = _nyse_days(str(series.index.min().date()), str(series.index.max().date()))
+    return series.loc[series.index.isin(days)].dropna()
 
 
 def latest_completed_session(now=None) -> pd.Timestamp:
@@ -77,6 +88,12 @@ def completed_daily_data(data: pd.DataFrame, now=None):
     data = data.sort_index().loc[:cutoff].dropna(how="all")
     if data.empty:
         raise ValueError("没有已完成交易日的数据。")
+    # Mixed-market downloads may include dates when US equities are closed.
+    # Preserve missing real sessions as NaN; never fill prices forward.
+    days = _nyse_days(str(data.index.min().date()), str(data.index.max().date()))
+    data = data.reindex(days)
+    if data.empty:
+        raise ValueError("没有已完成美股交易日的数据。")
     return data, cutoff
 
 
@@ -85,7 +102,8 @@ def require_history(data, ticker, sessions, asof=None, fields=("Close",)):
     if data.empty:
         raise ValueError("没有行情")
     target = pd.Timestamp(asof if asof is not None else data.index[-1]).normalize()
-    reference = data.index[data.index <= target][-sessions:]
+    start = target - pd.Timedelta(days=sessions * 2 + 30)
+    reference = _nyse_days(str(start.date()), str(target.date()))[-sessions:]
     if len(reference) < sessions or pd.Timestamp(reference[-1]).normalize() != target:
         raise ValueError(f"行情未更新到 {target.date()} 或历史不足{sessions}条")
     for field in fields:
@@ -95,7 +113,9 @@ def require_history(data, ticker, sessions, asof=None, fields=("Close",)):
             raise ValueError(f"缺少{field}数据") from None
         values = series.to_numpy(dtype=float)
         if not np.isfinite(values).all():
-            raise ValueError(f"{field}最近{sessions}条存在缺失或无效值")
+            missing = reference[~np.isfinite(values)]
+            dates = "、".join(d.strftime("%Y-%m-%d") for d in missing[:3])
+            raise ValueError(f"{field}最近{sessions}个美股交易日缺失或无效{len(missing)}条（{dates}），请刷新行情")
         if (values < 0).any() or (field != "Volume" and (values == 0).any()):
             raise ValueError(f"{field}包含无效价格或成交量")
 
